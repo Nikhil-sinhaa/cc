@@ -1,3 +1,1 @@
-stores/authStore.ts:3 - Cannot find module '@code-clash/shared-types/mvp-types' or its corresponding type declarations.
-stores/battleStore.ts:2 - Cannot find module '@code-clash/shared-types/mvp-types' or its corresponding type declarations.
-Total:2
+Total:0
