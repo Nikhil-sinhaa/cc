@@ -119,6 +119,15 @@ const ArenaPage: React.FC = () => {
         toast.error(error.message || 'Battle error occurred')
       })
 
+      newSocket.on('battle:submission_result', (data) => {
+        const { passed, total } = data
+        if (passed === 0) {
+          toast.error('All tests failed! No damage dealt.')
+        } else {
+          toast(`${passed}/${total} tests passed`)
+        }
+      })
+
       setSocket(newSocket)
 
       return () => {

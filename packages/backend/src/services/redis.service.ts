@@ -287,6 +287,21 @@ export class RedisService {
     });
   }
 
+  // Pattern-based subscribe for wildcard channels (e.g. 'battle:*:start')
+  async psubscribe(pattern: string, callback: (channel: string, message: any) => void): Promise<void> {
+    await this.subscriber.psubscribe(pattern);
+
+    this.subscriber.on('pmessage', (_pattern, receivedChannel, message) => {
+      if (_pattern === pattern) {
+        try {
+          callback(receivedChannel, JSON.parse(message));
+        } catch (error) {
+          console.error('Error parsing psubscribe message:', error);
+        }
+      }
+    });
+  }
+
   // Utility methods
   async ping(): Promise<string> {
     return this.client.ping();
