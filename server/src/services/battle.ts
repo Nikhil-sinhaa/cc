@@ -111,9 +111,11 @@ export class BattleService {
   /** Handle code submission — full submit flow (12 steps) */
   async handleSubmit(
     socket: Socket,
-    data: { code: string; languageId: number; roomId: string; userId: string }
+    data: { code: string; languageId?: number; language?: number; roomId: string; userId: string }
   ): Promise<void> {
-    const { code, languageId, roomId, userId } = data;
+    const { code, roomId, userId } = data;
+    // Support both field names from client
+    const languageId: number = (data.languageId ?? data.language ?? 63) as number;
 
     try {
       // ── Step 1: Ack immediately so client knows server received it ──
@@ -162,10 +164,7 @@ export class BattleService {
         submissionCount: isPlayer1 ? battleState.sub1Count : battleState.sub2Count,
       });
 
-      // Emit judging started to submitter
-      socket.emit('submit:judging', { message: 'Running test cases...' });
-
-      // ── Step 6: Run against Judge0 ──
+      // Emit judging started to submitter — with totalTests so client can init rows
       const { problem, testCases } = await this.getProblemData(battleState.problemId);
       if (!problem || testCases.length === 0) {
         socket.emit('submit:error', 'Problem data not found');
@@ -173,7 +172,18 @@ export class BattleService {
         return;
       }
 
-      const judgeSummary = await JudgeService.judge(code, languageId, testCases);
+      // ── Step 6: Run tests one-by-one and emit progress events ──
+      const totalTests = testCases.length;
+      socket.emit('submit:judging', { currentTest: 1, totalTests, message: 'Running test cases...' });
+
+      const judgeSummary = await JudgeService.judgeWithProgress(
+        code,
+        languageId,
+        testCases,
+        (current: number, total: number) => {
+          socket.emit('submit:judging', { currentTest: current, totalTests: total });
+        }
+      );
 
       // ── Step 7: First-solve check (atomic) ──
       const allPassed = judgeSummary.passedTests === judgeSummary.totalTests;

@@ -1,5 +1,15 @@
 import { create } from 'zustand';
-import { Puzzle } from '@code-clash/shared-types/mvp-types';
+
+export interface Puzzle {
+  id: string;
+  title: string;
+  description: string;
+  difficulty: 'easy' | 'medium' | 'hard';
+  examples?: Array<{ input: string; output: string }>;
+  tags?: string[];
+  timeLimitMs?: number;
+  p50RuntimeMs?: number;
+}
 
 interface BattleStore {
   roomId: string | null;
@@ -29,7 +39,7 @@ interface DamageLogEntry {
   timestamp: number;
 }
 
-export const useBattleStore = create<BattleStore>((set, get) => ({
+export const useBattleStore = create<BattleStore>((set) => ({
   roomId: null,
   puzzle: null,
   myHp: 500,

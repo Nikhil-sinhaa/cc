@@ -1,6 +1,15 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { User } from '@code-clash/shared-types/mvp-types';
+
+export interface User {
+  id: string;
+  username: string;
+  email: string;
+  elo: number;
+  wins: number;
+  losses: number;
+  avatar?: string;
+}
 
 interface AuthStore {
   user: User | null;
@@ -14,7 +23,7 @@ interface AuthStore {
 
 export const useAuthStore = create<AuthStore>()(
   persist(
-    (set, get) => ({
+    (set) => ({
       user: null,
       token: null,
       isAuthenticated: false,

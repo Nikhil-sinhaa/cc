@@ -37,6 +37,37 @@ export class JudgeService {
   /**
    * Main entry point — routes to the right evaluator
    */
+  /** Run all tests and call onProgress(currentTest, totalTests) after each one */
+  static async judgeWithProgress(
+    code: string,
+    languageId: number,
+    testCases: TestCase[],
+    onProgress: (current: number, total: number) => void
+  ): Promise<JudgeSummary> {
+    const lang = LANGUAGE_MAP[languageId] || 'unknown';
+    const results: JudgeResult[] = [];
+    const total = testCases.length;
+
+    for (let i = 0; i < testCases.length; i++) {
+      const tc = testCases[i];
+      let result: JudgeResult;
+      if (lang === 'javascript' || lang === 'typescript') {
+        result = await this.runJavaScript(code, tc);
+      } else {
+        result = await this.simulateOtherLanguage(code, tc, lang);
+      }
+      results.push(result);
+      // Notify server of progress after each test (i+1 = 1-indexed current)
+      onProgress(i + 1, total);
+    }
+
+    const passedTests = results.filter(r => r.passed).length;
+    const avgRuntimeMs =
+      results.reduce((sum, r) => sum + r.runtimeMs, 0) / Math.max(results.length, 1);
+
+    return { totalTests: total, passedTests, results, avgRuntimeMs };
+  }
+
   static async judge(
     code: string,
     languageId: number,

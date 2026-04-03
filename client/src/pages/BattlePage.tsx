@@ -128,7 +128,13 @@ export const BattlePage: React.FC = () => {
     });
 
     sock.on('battle:end', (data: any) => {
-      setEnd(data.winnerName, data.winnerEloChange || data.eloChange);
+      // Server sends winnerEloChange / loserEloChange; pick the right one for the current user
+      const myUserId = useAuthStore.getState().user?.id;
+      const iAmWinner = data.winnerId === myUserId;
+      const myEloChange = iAmWinner
+        ? (data.winnerEloChange ?? data.eloChange ?? 0)
+        : (data.loserEloChange ?? data.eloChange ?? 0);
+      setEnd(data.winnerName, myEloChange);
       setStatus('ENDED');
       if (data.newAchievements?.length > 0) {
         data.newAchievements.forEach((a: any) => {
@@ -336,7 +342,7 @@ export const BattlePage: React.FC = () => {
       roomId: activeRoomId,
       userId: user?.id,
       code: freshCode,
-      language: langId,
+      languageId: langId,   // server expects languageId (number)
       submittedAt: Date.now(),
     });
 
@@ -443,12 +449,12 @@ export const BattlePage: React.FC = () => {
                   {puzzle.description}
                 </p>
 
-                {puzzle.examples?.length > 0 && (
+                {(puzzle.examples?.length ?? 0) > 0 && (
                   <div style={{ marginBottom: 20 }}>
                     <div style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '1px', marginBottom: 10 }}>
                       Examples
                     </div>
-                    {puzzle.examples.slice(0, 3).map((ex: any, i: number) => (
+                    {puzzle.examples?.slice(0, 3).map((ex: any, i: number) => (
                       <div key={i} style={{
                         background: 'var(--bg-deep)',
                         border: '1px solid var(--border-subtle)',
@@ -465,9 +471,9 @@ export const BattlePage: React.FC = () => {
                   </div>
                 )}
 
-                {puzzle.tags?.length > 0 && (
+                {(puzzle.tags?.length ?? 0) > 0 && (
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                    {puzzle.tags.map((tag: string) => (
+                    {puzzle.tags?.map((tag: string) => (
                       <span key={tag} className="tag-chip">{tag}</span>
                     ))}
                   </div>
