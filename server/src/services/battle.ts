@@ -108,48 +108,54 @@ export class BattleService {
     }
   }
 
-  /** Handle code submission with distributed lock */
+  /** Handle code submission — full submit flow (12 steps) */
   async handleSubmit(
     socket: Socket,
     data: { code: string; languageId: number; roomId: string; userId: string }
   ): Promise<void> {
     const { code, languageId, roomId, userId } = data;
-    const lockKey = `submission:lock:${userId}`;
-    const lockTimeout = 10; // 10 seconds lock timeout
 
     try {
-      // Acquire distributed lock to prevent simultaneous submissions
-      const lockAcquired = await this.acquireDistributedLock(lockKey, lockTimeout);
-      if (!lockAcquired) {
-        socket.emit('submit:error', 'Please wait for your previous submission to complete');
+      // ── Step 1: Ack immediately so client knows server received it ──
+      socket.emit('submit:received', { timestamp: Date.now() });
+
+      // ── Step 2: Validate room + player slot ──
+      const battleState = await this.getBattleState(roomId);
+      if (!battleState || battleState.status !== 'ACTIVE') {
+        socket.emit('submit:error', 'Battle not active');
+        return;
+      }
+      if (!this.isPlayerInBattle(userId, battleState)) {
+        socket.emit('submit:error', 'Not in this battle');
         return;
       }
 
-      const battleState = await this.getBattleState(roomId);
-      if (!battleState) { 
-        await this.releaseDistributedLock(lockKey);
-        socket.emit('submit:error', 'Battle not found'); 
-        return; 
-      }
-      if (!this.isPlayerInBattle(userId, battleState)) { 
-        await this.releaseDistributedLock(lockKey);
-        socket.emit('submit:error', 'Not in this battle'); 
-        return; 
-      }
-      if (battleState.status !== 'ACTIVE') { 
-        await this.releaseDistributedLock(lockKey);
-        socket.emit('submit:error', 'Battle not active'); 
-        return; 
+      const isPlayer1 = battleState.player1Id === userId;
+      const opponentSlot = isPlayer1 ? 2 : 1;
+
+      // ── Step 3: Cooldown check (Redis NX lock) ──
+      const lockKey = `lock:submit:${roomId}:${userId}`;
+      const lock = await this.redis.set(lockKey, '1', { NX: true, EX: 8 });
+      if (!lock) {
+        const ttl = await (this.redis as any).ttl(lockKey);
+        socket.emit('submit:cooldown', { retryIn: ttl > 0 ? ttl : 8 });
+        return;
       }
 
-      const isPlayer1 = battleState.player1Id === userId;
+      // ── Step 4: Security scan ──
+      const blocked = this.scanForForbiddenPatterns(code, languageId);
+      if (blocked) {
+        await this.redis.del(lockKey); // refund cooldown
+        socket.emit('submit:error', `Forbidden pattern detected: ${blocked}`);
+        return;
+      }
+
+      // ── Step 5: Notify opponent that player submitted ──
+      socket.to(roomId).emit('opponent:submitted', { submittedAt: Date.now() });
 
       // Track submission count
       if (isPlayer1) battleState.sub1Count++;
       else battleState.sub2Count++;
-
-      battleState.status = 'JUDGING';
-      await this.saveBattleState(roomId, battleState);
 
       // Notify opponent of activity
       socket.to(roomId).emit('battle:opponent_activity', {
@@ -159,25 +165,32 @@ export class BattleService {
       // Emit judging started to submitter
       socket.emit('submit:judging', { message: 'Running test cases...' });
 
-      // Get problem + test cases
+      // ── Step 6: Run against Judge0 ──
       const { problem, testCases } = await this.getProblemData(battleState.problemId);
       if (!problem || testCases.length === 0) {
         socket.emit('submit:error', 'Problem data not found');
-        battleState.status = 'ACTIVE';
-        await this.saveBattleState(roomId, battleState);
-        await this.releaseDistributedLock(lockKey);
+        await this.redis.del(lockKey); // refund cooldown
         return;
       }
 
-      // Run judge
       const judgeSummary = await JudgeService.judge(code, languageId, testCases);
+
+      // ── Step 7: First-solve check (atomic) ──
+      const allPassed = judgeSummary.passedTests === judgeSummary.totalTests;
+      let isFirstSolve = false;
+      if (allPassed) {
+        const claimed = await this.redis.set(`firstsolve:${roomId}`, userId, { NX: true });
+        isFirstSolve = claimed !== null;
+      }
+
+      // ── Step 8: Calculate damage ──
       const elapsedMs = Date.now() - battleState.startTimestamp;
       const timeLimitMs = (problem.timeLimitMs || 300000);
+      const damage = this.calculateDamage(
+        judgeSummary, elapsedMs, timeLimitMs, problem.p50RuntimeMs || 1000, isFirstSolve
+      );
 
-      // Calculate damage
-      const damage = this.calculateDamage(judgeSummary, elapsedMs, timeLimitMs, problem.p50RuntimeMs || 1000);
-
-      // Apply damage
+      // ── Step 9: Apply damage + check win ──
       if (damage > 0) {
         if (isPlayer1) battleState.hp2 = Math.max(0, battleState.hp2 - damage);
         else battleState.hp1 = Math.max(0, battleState.hp1 - damage);
@@ -187,29 +200,43 @@ export class BattleService {
       await this.saveBattleState(roomId, battleState);
 
       // Get usernames for display
-      const [attacker, target] = await Promise.all([
-        UserService.getUserById(userId),
-        UserService.getUserById(isPlayer1 ? battleState.player2Id : battleState.player1Id),
-      ]);
+      const attacker = await UserService.getUserById(userId);
+      const attackerName = attacker?.username || 'Unknown';
 
-      // Emit result to submitter
-      socket.emit('submit:result', {
-        passed: judgeSummary.passedTests === judgeSummary.totalTests,
+      // Track submission count in Redis
+      const submissionCount = isPlayer1 ? battleState.sub1Count : battleState.sub2Count;
+
+      const newOpponentHP = isPlayer1 ? battleState.hp2 : battleState.hp1;
+
+      // ── Step 10: Broadcast to BOTH players ──
+      // Emit unified result to entire room
+      this.io.to(roomId).emit('submit:result', {
+        attackerId: userId,
+        attackerName,
+        passed: allPassed,
         passedTests: judgeSummary.passedTests,
         totalTests: judgeSummary.totalTests,
         damage,
+        newOpponentHP: Math.max(0, newOpponentHP),
         avgRuntimeMs: Math.round(judgeSummary.avgRuntimeMs),
+        isFirstSolve,
+        breakdown: {
+          base: damage,
+          speed: Math.round(damage * 0.3),
+          efficiency: Math.round(judgeSummary.avgRuntimeMs),
+          allPass: allPassed,
+          firstSolve: isFirstSolve,
+        },
+        submissionCount,
         results: judgeSummary.results.map(r => ({
           passed: r.passed,
           runtimeMs: r.runtimeMs,
           error: r.error,
-          // Don't expose hidden test case outputs
         })),
       });
 
-      // Broadcast damage event to room
+      // Also broadcast damage/no_damage events for backward compat with HpBar
       if (damage > 0) {
-        const attackerName = attacker?.username || 'Unknown';
         this.io.to(roomId).emit('battle:damage', {
           attackerName,
           damage,
@@ -219,15 +246,19 @@ export class BattleService {
           totalTests: judgeSummary.totalTests,
         });
       } else {
-        // No damage — inform room
         this.io.to(roomId).emit('battle:no_damage', {
-          attackerName: attacker?.username || 'Unknown',
+          attackerName,
           passedTests: judgeSummary.passedTests,
           totalTests: judgeSummary.totalTests,
         });
       }
 
-      // Save submission to DB
+      // ── Step 11: Check win condition ──
+      if (battleState.hp1 <= 0 || battleState.hp2 <= 0) {
+        await this.endBattle(roomId, battleState);
+      }
+
+      // ── Step 12: Save submission to DB for replay ──
       try {
         await this.saveSubmission({
           matchId: battleState.matchId,
@@ -244,11 +275,6 @@ export class BattleService {
         console.error('[Battle] Failed to save submission:', e);
       }
 
-      // Check win condition
-      if (battleState.hp1 <= 0 || battleState.hp2 <= 0) {
-        await this.endBattle(roomId, battleState);
-      }
-
     } catch (error) {
       console.error('[Battle] Submit error:', error);
       socket.emit('submit:error', 'Execution failed');
@@ -258,9 +284,6 @@ export class BattleService {
         s.status = 'ACTIVE';
         await this.saveBattleState(roomId, s);
       }
-    } finally {
-      // Always release the lock
-      await this.releaseDistributedLock(lockKey);
     }
   }
 
@@ -310,7 +333,7 @@ export class BattleService {
   }
 
   /** End a battle and update ELO */
-  private async endBattle(
+  async endBattle(
     roomId: string,
     battleState: BattleState,
     overrideWinnerId?: string
@@ -399,12 +422,13 @@ export class BattleService {
     return { winnerChange: Math.max(1, winnerChange), loserChange: Math.min(-1, loserChange) };
   }
 
-  /** Damage calculation */
+  /** Damage calculation (with first-solve bonus) */
   private calculateDamage(
     judgeSummary: { passedTests: number; totalTests: number; avgRuntimeMs: number },
     elapsedMs: number,
     timeLimitMs: number,
-    p50RuntimeMs: number
+    p50RuntimeMs: number,
+    isFirstSolve: boolean = false
   ): number {
     const { passedTests, totalTests, avgRuntimeMs } = judgeSummary;
 
@@ -424,10 +448,37 @@ export class BattleService {
       ? Math.round(30 * (1 - avgRuntimeMs / p50RuntimeMs))
       : 0;
 
-    const baseDamage = 80;
-    const damage = Math.round(baseDamage * speedMult) + efficiencyBonus;
+    // First-solve bonus: +20 for being the first to pass all tests
+    const firstSolveBonus = isFirstSolve ? 20 : 0;
 
-    return Math.min(damage, 120); // Cap at 120
+    const baseDamage = 80;
+    const damage = Math.round(baseDamage * speedMult) + efficiencyBonus + firstSolveBonus;
+
+    return Math.min(damage, 140); // Cap at 140 (raised for first-solve)
+  }
+
+  /** Security scan — reject code with dangerous patterns */
+  private scanForForbiddenPatterns(code: string, languageId: number): string | null {
+    // Patterns that could be used for code injection / sandbox escape
+    const forbiddenPatterns: Array<{ regex: RegExp; label: string }> = [
+      { regex: /\bprocess\.exit\b/i, label: 'process.exit' },
+      { regex: /\brequire\s*\(\s*['"]child_process['"]\s*\)/i, label: 'child_process' },
+      { regex: /\brequire\s*\(\s*['"]fs['"]\s*\)/i, label: 'fs module' },
+      { regex: /\beval\s*\(/i, label: 'eval()' },
+      { regex: /\bFunction\s*\(/i, label: 'Function()' },
+      { regex: /\bexec\s*\(/i, label: 'exec()' },
+      { regex: /\bspawn\s*\(/i, label: 'spawn()' },
+      { regex: /\bimport\s*\(\s*['"]os['"]\s*\)/i, label: 'os import' },
+      { regex: /\b__import__\s*\(/i, label: '__import__' },
+      { regex: /\bopen\s*\(\s*['"]\//i, label: 'file read' },
+      { regex: /system\s*\(/i, label: 'system()' },
+      { regex: /Runtime\.getRuntime\(\)/i, label: 'Runtime.getRuntime()' },
+    ];
+
+    for (const { regex, label } of forbiddenPatterns) {
+      if (regex.test(code)) return label;
+    }
+    return null;
   }
 
   /** Helpers */

@@ -1,10 +1,8 @@
-import { PrismaClient } from '@prisma/client';
+// In-memory database replaces PostgreSQL/Prisma (no Docker needed)
+import { db } from './inMemoryDb';
 
-// Create a singleton Prisma client instance
-const globalForPrisma = globalThis as unknown as {
-  prisma: PrismaClient | undefined;
-};
+// Export as `prisma` so all existing imports work without changing any consumers
+export const prisma = db as any;
 
-export const prisma = globalForPrisma.prisma ?? new PrismaClient();
-
-if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;
+// Initialize the in-memory DB (seeds demo users + problems)
+db.init().catch(console.error);

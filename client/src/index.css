@@ -535,3 +535,246 @@ body {
 .truncate { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .select-none { user-select: none; }
 .cursor-pointer { cursor: pointer; }
+
+/* ─── Submit Button State Machine ────────────────────────────*/
+.submit-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 120px;
+  padding: 7px 16px;
+  border-radius: var(--radius-md);
+  font-family: var(--font-ui);
+  font-weight: 700;
+  font-size: 0.82rem;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  outline: none;
+  overflow: visible;
+  z-index: 1;
+}
+.submit-btn:active:not(:disabled) { transform: scale(0.96); }
+.submit-btn:disabled { cursor: not-allowed; }
+
+/* State: disabled */
+.submit-disabled {
+  background: rgba(74, 96, 128, 0.15);
+  border-color: rgba(74, 96, 128, 0.3);
+  color: var(--text-muted);
+  opacity: 0.35;
+}
+
+/* State: idle — ready to submit */
+.submit-idle {
+  background: linear-gradient(135deg, rgba(0, 255, 136, 0.2), rgba(0, 184, 92, 0.12));
+  border-color: var(--green);
+  color: var(--green);
+  box-shadow: 0 0 14px rgba(0, 255, 136, 0.25), inset 0 0 10px rgba(0, 255, 136, 0.06);
+}
+.submit-idle:hover {
+  background: linear-gradient(135deg, rgba(0, 255, 136, 0.3), rgba(0, 184, 92, 0.2));
+  box-shadow: var(--glow-green);
+  transform: translateY(-1px);
+}
+
+/* State: submitting — waiting for server ack */
+.submit-submitting {
+  background: linear-gradient(135deg, rgba(0, 255, 136, 0.15), rgba(0, 184, 92, 0.1));
+  border-color: var(--green-dim);
+  color: var(--green-dim);
+  animation: submit-sending-pulse 1.2s ease-in-out infinite;
+}
+@keyframes submit-sending-pulse {
+  0%, 100% { opacity: 0.7; box-shadow: 0 0 8px rgba(0, 255, 136, 0.15); }
+  50%      { opacity: 1;   box-shadow: 0 0 20px rgba(0, 255, 136, 0.35); }
+}
+
+/* State: judging — Judge0 running tests (amber pulse per spec) */
+.submit-judging {
+  background: linear-gradient(135deg, rgba(255, 170, 0, 0.2), rgba(200, 130, 0, 0.12));
+  border-color: var(--gold);
+  color: var(--gold);
+  animation: submit-judging-pulse 0.8s ease-in-out infinite;
+}
+@keyframes submit-judging-pulse {
+  0%, 100% { box-shadow: 0 0 8px rgba(255, 170, 0, 0.2); }
+  50%      { box-shadow: 0 0 24px rgba(255, 170, 0, 0.5); }
+}
+
+/* ── Submit button wrapper (positions judging panel) ─────────*/
+.submit-btn-wrapper {
+  position: relative;
+  display: inline-block;
+}
+
+/* ── Inline spinner for submitting / judging states ──────────*/
+.submit-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(0, 255, 136, 0.3);
+  border-top-color: var(--green);
+  border-radius: 50%;
+  animation: spin-ring 0.7s linear infinite;
+  flex-shrink: 0;
+}
+.submit-spinner-amber {
+  border-color: rgba(255, 215, 0, 0.3);
+  border-top-color: var(--gold);
+}
+
+/* ── Judging Panel — test case rows with 80ms stagger ────────*/
+.judging-panel {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  min-width: 200px;
+  background: var(--bg-card);
+  border: 1px solid rgba(255, 215, 0, 0.25);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 16px rgba(255, 215, 0, 0.1);
+  padding: 8px 0;
+  z-index: 50;
+  animation: judging-panel-in 0.25s ease-out;
+}
+@keyframes judging-panel-in {
+  0%   { opacity: 0; transform: translateY(6px) scale(0.95); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+.judging-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px 8px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--gold);
+  border-bottom: 1px solid rgba(255, 215, 0, 0.12);
+  margin-bottom: 4px;
+}
+.judging-panel-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--gold);
+  box-shadow: 0 0 6px var(--gold);
+  animation: blink 1s ease-in-out infinite;
+}
+
+/* Individual test case rows — staggered entrance */
+.judging-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  font-size: 0.78rem;
+  font-family: var(--font-code);
+  opacity: 0;
+  transform: translateX(12px);
+  animation: judging-row-in 0.3s ease-out forwards;
+}
+@keyframes judging-row-in {
+  0%   { opacity: 0; transform: translateX(12px); }
+  100% { opacity: 1; transform: translateX(0); }
+}
+.judging-row-icon { font-size: 0.85rem; flex-shrink: 0; }
+.judging-row-label { flex: 1; color: var(--text-secondary); }
+.judging-row-status {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.judging-status-pending { color: var(--text-muted); background: rgba(74, 96, 128, 0.15); }
+.judging-status-running { color: var(--gold); background: rgba(255, 215, 0, 0.12); animation: blink 0.8s ease-in-out infinite; }
+.judging-status-passed  { color: var(--green); background: rgba(0, 255, 136, 0.12); }
+.judging-status-failed  { color: var(--red); background: rgba(255, 48, 96, 0.12); }
+
+/* State: cooldown — waiting between submits */
+.submit-cooldown {
+  background: linear-gradient(135deg, rgba(255, 215, 0, 0.12), rgba(200, 168, 0, 0.08));
+  border-color: var(--gold-dim);
+  color: var(--gold);
+  opacity: 0.85;
+}
+/* Cooldown ring around button */
+.submit-cooldown-ring {
+  position: absolute;
+  inset: -4px;
+  border-radius: calc(var(--radius-md) + 4px);
+  border: 2px solid transparent;
+  pointer-events: none;
+  z-index: -1;
+}
+.submit-cooldown-ring::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  border: 2px solid var(--gold-dim);
+  opacity: 0.3;
+}
+.submit-cooldown-ring::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  border: 2px solid var(--gold);
+  clip-path: polygon(0 0, 100% 0, 100% 100%, 0 100%);
+  animation: cooldown-deplete var(--cooldown-duration, 8s) linear forwards;
+}
+@keyframes cooldown-deplete {
+  0%   { clip-path: polygon(50% 50%, 50% 0%, 100% 0%, 100% 100%, 0% 100%, 0% 0%, 50% 0%); opacity: 1; }
+  100% { clip-path: polygon(50% 50%, 50% 0%, 50% 0%, 50% 0%, 50% 0%, 50% 0%, 50% 0%); opacity: 0.3; }
+}
+
+/* State: all_passed — solved! permanent green glow */
+.submit-all-passed {
+  background: linear-gradient(135deg, rgba(0, 255, 136, 0.25), rgba(0, 200, 100, 0.18));
+  border-color: var(--green);
+  color: var(--green);
+  box-shadow: 0 0 20px rgba(0, 255, 136, 0.4), 0 0 60px rgba(0, 255, 136, 0.15), inset 0 0 12px rgba(0, 255, 136, 0.08);
+  animation: solved-glow 2s ease-in-out infinite;
+}
+.submit-all-passed:hover {
+  box-shadow: 0 0 30px rgba(0, 255, 136, 0.6), 0 0 80px rgba(0, 255, 136, 0.2);
+}
+@keyframes solved-glow {
+  0%, 100% { box-shadow: 0 0 20px rgba(0,255,136,0.4), 0 0 60px rgba(0,255,136,0.15); }
+  50%      { box-shadow: 0 0 30px rgba(0,255,136,0.6), 0 0 80px rgba(0,255,136,0.25); }
+}
+
+/* State: partial — some tests passed */
+.submit-partial {
+  background: linear-gradient(135deg, rgba(255, 215, 0, 0.2), rgba(255, 170, 0, 0.12));
+  border-color: var(--gold);
+  color: var(--gold);
+  box-shadow: 0 0 12px rgba(255, 215, 0, 0.25);
+  animation: partial-flash 0.4s ease-out;
+}
+
+/* State: failed — 0 tests passed */
+.submit-failed {
+  background: linear-gradient(135deg, rgba(255, 48, 96, 0.2), rgba(204, 26, 64, 0.12));
+  border-color: var(--red);
+  color: var(--red);
+  box-shadow: 0 0 12px rgba(255, 48, 96, 0.25);
+  animation: failed-flash 0.4s ease-out;
+}
+@keyframes partial-flash {
+  0%   { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+@keyframes failed-flash {
+  0%  { transform: scale(1.05); }
+  50% { transform: translateX(-3px); }
+  100% { transform: translateX(0) scale(1); }
+}
+

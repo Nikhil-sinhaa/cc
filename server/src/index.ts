@@ -1,9 +1,9 @@
 import express from 'express';
 import { createServer } from 'http';
 import { Server, Socket } from 'socket.io';
-import { createClient, RedisClientType } from 'redis';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { InMemoryRedis, inMemoryRedis } from './lib/inMemoryRedis';
 
 import { AuthMiddleware } from './middleware/auth';
 import { MatchmakingService } from './services/matchmaking';
@@ -33,10 +33,8 @@ app.use(cors({
 app.use(express.json());
 app.use(express.static('public'));
 
-// Redis client
-const redis: RedisClientType = createClient({
-  url: process.env.REDIS_URL || 'redis://localhost:6379',
-});
+// In-memory Redis (no external process needed)
+const redis: InMemoryRedis = inMemoryRedis;
 
 // Socket.io setup
 const io = new Server(server, {
@@ -54,10 +52,10 @@ const io = new Server(server, {
 // couldn't notify players because getUserSocket always returned null.
 const socketRegistry = new Map<string, Socket>();
 
-// Services
-const matchmakingService = new MatchmakingService(io, redis, socketRegistry);
-const battleService = new BattleService(io, redis, socketRegistry);
-const spellService = new SpellService(redis);
+// Services (cast redis to any — InMemoryRedis matches the duck type)
+const matchmakingService = new MatchmakingService(io, redis as any, socketRegistry);
+const battleService = new BattleService(io, redis as any, socketRegistry);
+const spellService = new SpellService(redis as any);
 
 // ─── REST Routes ─────────────────────────────────────────────────────────────
 
@@ -108,7 +106,7 @@ app.get('/leaderboard', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit as string) || 50;
     const leaderboard = await UserService.getLeaderboard(limit);
-    const ranked = leaderboard.map((user, index) => ({
+    const ranked = leaderboard.map((user: any, index: number) => ({
       rank: index + 1,
       ...user,
       winRate: user.wins + user.losses > 0
@@ -160,30 +158,9 @@ io.on('connection', (socket) => {
       (socket as any).username = payload.username;
       (socket as any).elo = payload.elo || 1000;
 
-      // Check for session conflict before registering
-      const existingSocketId = await redis.get(`session:${payload.userId}`);
-      if (existingSocketId && existingSocketId !== socket.id) {
-        socket.emit('session:conflict', {
-          message: 'You have another active session. The previous session will be disconnected.',
-          existingSocketId
-        });
-        
-        // Disconnect the old socket
-        const oldSocket = socketRegistry.get(payload.userId);
-        if (oldSocket && oldSocket.id === existingSocketId) {
-          oldSocket.emit('session:displaced', {
-            message: 'You have been disconnected due to login from another tab.'
-          });
-          oldSocket.disconnect();
-        }
-        
-        // Clear old session
-        await redis.del(`session:${payload.userId}`);
-      }
-
-      // Register socket and session
+      // Update socket registry to the latest socket for this user
       socketRegistry.set(payload.userId, socket);
-      await redis.setEx(`session:${payload.userId}`, 3600, socket.id); // 1 hour TTL
+      await redis.setEx(`session:${payload.userId}`, 3600, socket.id);
 
       console.log(`[Auth] ${payload.username} authenticated (ELO: ${(socket as any).elo})`);
       socket.emit('authenticated', { userId: payload.userId, username: payload.username });
@@ -241,6 +218,47 @@ io.on('connection', (socket) => {
 
   socket.on('battle:ready', async (data: { roomId: string }) => {
     await battleService.startCountdown(data.roomId);
+  });
+
+  // ── Battle Rejoin (battle page mounts fresh socket, needs to rejoin room) ────
+  socket.on('battle:rejoin', async (data: { roomId: string }) => {
+    const userId = (socket as any).userId;
+    if (!userId) { socket.emit('error', 'Not authenticated'); return; }
+
+    const { roomId } = data;
+    const battleState = await battleService.getBattleStatePublic(roomId);
+    if (!battleState) {
+      socket.emit('battle:rejoin_failed', { reason: 'battle_not_found' });
+      return;
+    }
+
+    // Verify this user is in this battle
+    if (battleState.player1Id !== userId && battleState.player2Id !== userId) {
+      socket.emit('battle:rejoin_failed', { reason: 'not_in_battle' });
+      return;
+    }
+
+    // Join the socket.io room
+    socket.join(roomId);
+    console.log(`[Rejoin] ${(socket as any).username} rejoined battle room ${roomId} (status: ${battleState.status})`);
+
+    // If battle is active, immediately tell the client to start
+    if (battleState.status === 'ACTIVE') {
+      socket.emit('battle:start', {});
+    } else if (battleState.status === 'COUNTDOWN') {
+      socket.emit('battle:countdown', { secondsLeft: 1 });
+    } else if (battleState.status === 'ENDED') {
+      socket.emit('battle:end_state', battleState);
+    }
+
+    // Send current HP state
+    socket.emit('battle:state_sync', {
+      hp1: battleState.hp1,
+      hp2: battleState.hp2,
+      status: battleState.status,
+      player1Id: battleState.player1Id,
+      player2Id: battleState.player2Id,
+    });
   });
 
   // ── Spells ──────────────────────────────────────────────────────────────────
@@ -421,18 +439,13 @@ const PORT = process.env.PORT || 3001;
 
 async function startServer() {
   try {
-    await redis.connect();
-    console.log('✅ Connected to Redis');
-    
-    // Check for orphaned grace timers on startup
-    await cleanupOrphanedGraceTimers();
-    
-    // Check for orphaned battles from server crash
-    await battleService.checkOrphanedBattles();
+    // In-memory Redis — no connection needed
+    console.log('✅ In-memory Redis ready');
 
     server.listen(PORT, () => {
       console.log(`🚀 CodeClash server running on port ${PORT}`);
       console.log(`   Socket.io: ws://localhost:${PORT}`);
+      console.log(`   Demo: dev@test.com / password`);
     });
   } catch (error) {
     console.error('❌ Failed to start server:', error);

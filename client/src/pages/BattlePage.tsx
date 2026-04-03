@@ -6,6 +6,7 @@ import { useAuthStore } from '../stores/authStore';
 import { useBattleStore } from '../stores/battleStore';
 import { HpBar } from '../components/HpBar';
 import { SpellPanel } from '../components/SpellPanel';
+import { SubmitButton, type SubmitState, type TestCaseStatus } from '../components/SubmitButton';
 
 const SERVER_URL = 'http://localhost:3001';
 const MAX_HP = 500;
@@ -33,14 +34,25 @@ export const BattlePage: React.FC = () => {
   const [code, setCode] = useState('// Write your solution here\n');
   const [langId, setLangId] = useState(63); // JS default
   const [socket, setSocket] = useState<Socket | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [damageToasts, setDamageToasts] = useState<DamageToast[]>([]);
   const [achievementToasts, setAchievementToasts] = useState<AchievementToast[]>([]);
   const [submitResult, setSubmitResult] = useState<any>(null);
   const [isSlowed, setIsSlowed] = useState(false);
   const [opponentActivity, setOpponentActivity] = useState(0);
+
+  // ── Submit button state machine (8 states) ──
+  const [submitState, setSubmitState] = useState<SubmitState>('disabled');
+  const [cooldownLeft, setCooldownLeft] = useState(0);
+  const [hasAllPassed, setHasAllPassed] = useState(false); // permanent for this battle
+  const [judgingProgress, setJudgingProgress] = useState<string>(''); // "Running test 2/8..."
+  const [testCases, setTestCases] = useState<TestCaseStatus[]>([]);  // live test case rows
+
   const timerRef = useRef<number | null>(null);
+  const isPlayer1Ref = useRef<boolean | null>(null); // null = unknown until state_sync
+  const editorRef = useRef<any>(null); // Bug #6: Monaco ref for fresh value
+  const submitTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cooldownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Countdown timer
   useEffect(() => {
@@ -56,13 +68,15 @@ export const BattlePage: React.FC = () => {
   useEffect(() => {
     if (!token) { navigate('/login'); return; }
 
-    const sock = io(SERVER_URL);
+    // Bug #4: Pass JWT token in socket handshake auth option
+    const sock = io(SERVER_URL, { auth: { token: localStorage.getItem('jwt') || token } });
     setSocket(sock);
     sock.emit('authenticate', { token });
 
     sock.on('match:found', (data: any) => {
       setBattle(data.roomId, data.puzzle, data.opponentName);
       setTimeRemaining(data.timeLimitSeconds || 300);
+      if (data.myHp !== undefined) setHp(data.myHp, data.opponentHp);
     });
 
     sock.on('battle:countdown', (data: any) => {
@@ -70,13 +84,33 @@ export const BattlePage: React.FC = () => {
       setStatus('COUNTDOWN');
     });
 
-    sock.on('battle:start', () => {
+    sock.on('battle:start', (data: any) => {
       setCountdown(null);
       setStatus('ACTIVE');
+      // Resync time from server if provided
+      if (data?.timeLimitSeconds) setTimeRemaining(data.timeLimitSeconds);
+    });
+
+    // Server timer tick — keeps client in sync and recovers status if page was reloaded
+    sock.on('battle:tick', (data: any) => {
+      if (data.remainingSeconds !== undefined) setTimeRemaining(Math.round(data.remainingSeconds));
+      // Force ACTIVE if stuck on WAITING/COUNTDOWN (handles page refresh during active battle)
+      const currentStatus = useBattleStore.getState().status;
+      if (currentStatus === 'WAITING' || currentStatus === 'COUNTDOWN') {
+        setCountdown(null);
+        setStatus('ACTIVE');
+      }
     });
 
     sock.on('battle:damage', (data: any) => {
-      setHp(data.hp1, data.hp2);
+      // Map hp1/hp2 from server to myHp/opponentHp correctly
+      if (isPlayer1Ref.current !== null) {
+        const myHp = isPlayer1Ref.current ? data.hp1 : data.hp2;
+        const oppHp = isPlayer1Ref.current ? data.hp2 : data.hp1;
+        setHp(myHp, oppHp);
+      } else {
+        setHp(data.hp1, data.hp2);
+      }
       addDamage(data.attackerName, data.damage);
       addToast(`💥 ${data.attackerName} dealt ${data.damage} DMG!`, data.damage > 60 ? 'var(--magenta)' : 'var(--red)');
     });
@@ -103,19 +137,85 @@ export const BattlePage: React.FC = () => {
       }
     });
 
-    sock.on('submit:judging', () => { setStatus('JUDGING'); setIsSubmitting(true); });
+    // ── Submit state machine transitions ──
+    sock.on('submit:received', () => {
+      setSubmitState('submitting');
+    });
+
+    sock.on('submit:judging', (data: any) => {
+      setSubmitState('judging');
+      const current = data?.currentTest ?? 0;
+      const total = data?.totalTests ?? 0;
+
+      if (current && total) {
+        setJudgingProgress(`Running test ${current}/${total}...`);
+
+        // Build test case rows with live status
+        setTestCases(prev => {
+          // Initialize rows on first event or if total changed
+          const rows: TestCaseStatus[] = prev.length === total
+            ? [...prev]
+            : Array.from({ length: total }, (_, i) => ({ index: i, status: 'pending' as const }));
+
+          // Mark previous tests as passed (server sends them sequentially)
+          for (let i = 0; i < current - 1; i++) {
+            if (rows[i]) rows[i] = { ...rows[i], status: 'passed' };
+          }
+          // Mark current test as running
+          if (rows[current - 1]) rows[current - 1] = { ...rows[current - 1], status: 'running' };
+
+          return rows;
+        });
+      } else {
+        setJudgingProgress('Running tests...');
+      }
+    });
 
     sock.on('submit:result', (data: any) => {
-      setIsSubmitting(false);
       setStatus('ACTIVE');
       setSubmitResult(data);
       setTimeout(() => setSubmitResult(null), 5000);
+      setJudgingProgress('');
+      setTestCases([]);  // clear judging rows
+
+      // Clear safety timeout
+      if (submitTimeoutRef.current) clearTimeout(submitTimeoutRef.current);
+
+      // Determine next submitState based on result
+      const allPassed = data.passed || data.passedTests === data.totalTests;
+      if (allPassed) {
+        setHasAllPassed(true);
+        setSubmitState('all_passed');
+      } else if (data.passedTests > 0) {
+        setSubmitState('partial');
+      } else {
+        setSubmitState('failed');
+      }
+
+      // After 3s, transition partial/failed back to idle (or all_passed if solved)
+      setTimeout(() => {
+        setSubmitState(prev => {
+          if (prev === 'partial' || prev === 'failed') {
+            return hasAllPassed ? 'all_passed' : 'idle';
+          }
+          return prev;
+        });
+      }, 3000);
     });
 
+    // Error handling
     sock.on('submit:error', (msg: string) => {
-      setIsSubmitting(false);
+      setSubmitState(hasAllPassed ? 'all_passed' : 'idle');
       setStatus('ACTIVE');
+      setJudgingProgress('');
+      setTestCases([]);  // clear judging rows
       addToast(`⚠️ ${msg}`, 'var(--red)');
+      if (submitTimeoutRef.current) clearTimeout(submitTimeoutRef.current);
+    });
+
+    // Server-authoritative cooldown
+    sock.on('submit:cooldown', ({ retryIn }: { retryIn: number }) => {
+      startCooldownTimer(retryIn);
     });
 
     sock.on('spell:incoming', (data: any) => {
@@ -126,17 +226,51 @@ export const BattlePage: React.FC = () => {
       }
     });
 
-    // If navigating directly to /battle/:roomId but no battle in store yet,
-    // the socket will receive match:found on reconnection
-    if (paramRoomId && !roomId) {
-      sock.on('authenticated', () => {
-        // Try to rejoin room
-        sock.emit('battle:rejoin', { roomId: paramRoomId });
-      });
-    }
+    // — Always rejoin the battle room after authenticating —
+    // This handles: normal match flow, page refresh, direct URL navigation
+    const targetRoomId = paramRoomId || roomId;
+    sock.on('authenticated', () => {
+      if (targetRoomId) {
+        sock.emit('battle:rejoin', { roomId: targetRoomId });
+      }
+    });
 
-    return () => { sock.close(); clearInterval(timerRef.current!); };
+    // Sync HP/status from server on rejoin
+    sock.on('battle:state_sync', (data: any) => {
+      const myId = user?.id;
+      isPlayer1Ref.current = data.player1Id === myId;
+      const myHp = isPlayer1Ref.current ? data.hp1 : data.hp2;
+      const oppHp = isPlayer1Ref.current ? data.hp2 : data.hp1;
+      setHp(myHp, oppHp);
+      if (data.status === 'ACTIVE') {
+        setCountdown(null);
+        setStatus('ACTIVE');
+      }
+    });
+
+    return () => {
+      sock.close();
+      clearInterval(timerRef.current!);
+      if (submitTimeoutRef.current) clearTimeout(submitTimeoutRef.current);
+      if (cooldownIntervalRef.current) clearInterval(cooldownIntervalRef.current);
+    };
   }, [token]);
+
+  // ── Derive submitState from battle status ──
+  useEffect(() => {
+    if (status === 'ACTIVE' && submitState === 'disabled') {
+      setSubmitState(hasAllPassed ? 'all_passed' : 'idle');
+    }
+    if (status === 'ENDED') {
+      setSubmitState('disabled');
+    }
+    if (status !== 'ACTIVE' && status !== 'ENDED' && submitState !== 'disabled') {
+      // WAITING / COUNTDOWN → disabled
+      if (!['submitting', 'judging', 'cooldown'].includes(submitState)) {
+        setSubmitState('disabled');
+      }
+    }
+  }, [status, submitState, hasAllPassed]);
 
   const addToast = (text: string, color: string) => {
     const id = Math.random().toString(36);
@@ -144,15 +278,80 @@ export const BattlePage: React.FC = () => {
     setTimeout(() => setDamageToasts(prev => prev.filter(t => t.id !== id)), 4000);
   };
 
-  const handleSubmit = useCallback(() => {
-    if (!socket || !roomId || isSubmitting || status !== 'ACTIVE' || isSlowed) return;
-    socket.emit('battle:submit', { code, languageId: langId, roomId });
-  }, [socket, roomId, code, langId, isSubmitting, status, isSlowed]);
+  // ── Cooldown timer with visible countdown ──
+  const startCooldownTimer = useCallback((seconds: number) => {
+    setSubmitState('cooldown');
+    setCooldownLeft(seconds);
+
+    // Clear any existing countdown
+    if (cooldownIntervalRef.current) clearInterval(cooldownIntervalRef.current);
+
+    cooldownIntervalRef.current = setInterval(() => {
+      setCooldownLeft(prev => {
+        if (prev <= 1) {
+          if (cooldownIntervalRef.current) clearInterval(cooldownIntervalRef.current);
+          // Cooldown done → go back to idle or all_passed
+          setSubmitState(hasAllPassed ? 'all_passed' : 'idle');
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }, [hasAllPassed]);
+
+  // ── Submit handler (state machine driven) ──
+  const handleSubmit = useCallback(async () => {
+    // Guard 1: socket connected
+    if (!socket?.connected) {
+      addToast('Reconnecting to server...', 'var(--gold)');
+      return;
+    }
+    // Guard 2: battle is actually live
+    if (status !== 'ACTIVE') {
+      addToast("Battle hasn't started yet", 'var(--gold)');
+      return;
+    }
+    // Guard 3: roomId exists
+    const activeRoomId = roomId || paramRoomId;
+    if (!activeRoomId) {
+      addToast('Room not found — try refreshing', 'var(--red)');
+      return;
+    }
+    // Guard 4: not in a non-clickable state
+    if (['disabled', 'submitting', 'judging', 'cooldown'].includes(submitState)) return;
+    // Guard 5: not slowed by spell
+    if (isSlowed) return;
+
+    // Bug #6: Read code from Monaco ref (not stale React state)
+    const freshCode = editorRef.current?.getValue() ?? '';
+    if (!freshCode.trim()) {
+      addToast('Editor is empty', 'var(--red)');
+      return;
+    }
+
+    // Transition to submitting state
+    setSubmitState('submitting');
+
+    socket.emit('battle:submit', {
+      roomId: activeRoomId,
+      userId: user?.id,
+      code: freshCode,
+      language: langId,
+      submittedAt: Date.now(),
+    });
+
+    // Timeout safety: if no response in 12s → reset state
+    submitTimeoutRef.current = setTimeout(() => {
+      setSubmitState(hasAllPassed ? 'all_passed' : 'idle');
+      addToast('Server took too long — try again', 'var(--red)');
+    }, 12000);
+  }, [socket, roomId, paramRoomId, langId, submitState, status, isSlowed, user, hasAllPassed]);
 
   const handleForfeit = () => {
-    if (!socket || !roomId) return;
+    const activeRoomId = roomId || paramRoomId;
+    if (!socket || !activeRoomId) return;
     if (confirm('Are you sure you want to forfeit?')) {
-      socket.emit('battle:forfeit', { roomId });
+      socket.emit('battle:forfeit', { roomId: activeRoomId });
     }
   };
 
@@ -330,15 +529,13 @@ export const BattlePage: React.FC = () => {
               >
                 Forfeit
               </button>
-              <button
-                id="submit-btn"
+              <SubmitButton
+                state={isSlowed ? 'disabled' : submitState}
+                cooldownLeft={cooldownLeft}
+                judgingProgress={judgingProgress}
+                testCases={testCases}
                 onClick={handleSubmit}
-                disabled={isSubmitting || status !== 'ACTIVE' || isSlowed}
-                className="btn btn-sm btn-cyan"
-                style={{ minWidth: 100 }}
-              >
-                {isSubmitting ? '⏳ Judging...' : '▶ Submit'}
-              </button>
+              />
             </div>
           </div>
 
@@ -349,6 +546,7 @@ export const BattlePage: React.FC = () => {
               language={monacoLang}
               value={code}
               onChange={v => setCode(v || '')}
+              onMount={(editor) => { editorRef.current = editor; }} // Bug #6: capture Monaco ref
               theme="vs-dark"
               options={{
                 fontSize: 14,
@@ -357,7 +555,7 @@ export const BattlePage: React.FC = () => {
                 wordWrap: 'on',
                 lineNumbers: 'on',
                 scrollBeyondLastLine: false,
-                readOnly: status === 'ENDED' || isSubmitting,
+                readOnly: status === 'ENDED' || submitState === 'submitting' || submitState === 'judging',
                 padding: { top: 12 },
               }}
             />
